@@ -1,4 +1,7 @@
+import 'dart:typed_data';
+import 'dart:ui';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:scribble/scribble.dart';
 import 'package:flutter_colorpicker/flutter_colorpicker.dart';
@@ -6,6 +9,7 @@ import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'package:image/image.dart' as img;
 import 'package:google_fonts/google_fonts.dart';
+import 'package:image_gallery_saver/image_gallery_saver.dart';
 
 class DrawingScreen extends StatefulWidget {
   final File? image;
@@ -14,6 +18,15 @@ class DrawingScreen extends StatefulWidget {
 
   @override
   _DrawingScreenState createState() => _DrawingScreenState();
+}
+
+List<EditAction> _actions = [];
+
+class EditAction {
+  final String type; // "text", "shape", or "brush"
+  final dynamic object; // The actual text, shape, or brush stroke
+
+  EditAction({required this.type, required this.object});
 }
 
 class _DrawingScreenState extends State<DrawingScreen> {
@@ -25,9 +38,11 @@ class _DrawingScreenState extends State<DrawingScreen> {
   String _currentShape = 'line';
   Color _currentColor = Colors.black;
   double _strokeWidth = 3.0;
+  final GlobalKey _repaintKey = GlobalKey();
 
   List<_DrawnText> _texts = [];
   List<_DrawnShape> _shapes = [];
+  List<Offset> _currentBrushStroke = [];
   _DrawnText? _selectedText;
   _DrawnShape? _currentShapeInstance;
 
@@ -49,7 +64,8 @@ class _DrawingScreenState extends State<DrawingScreen> {
   }
 
   Future<void> _pickImage() async {
-    final pickedFile = await ImagePicker().pickImage(source: ImageSource.gallery);
+    final pickedFile =
+        await ImagePicker().pickImage(source: ImageSource.gallery);
     if (pickedFile != null) {
       setState(() {
         _image = File(pickedFile.path);
@@ -64,7 +80,7 @@ class _DrawingScreenState extends State<DrawingScreen> {
         return AlertDialog(
           title: Text('Pick a color'),
           content: SingleChildScrollView(
-            child: ColorPicker(
+            child: BlockPicker(
               pickerColor: _currentColor,
               onColorChanged: (color) {
                 setState(() {
@@ -78,7 +94,26 @@ class _DrawingScreenState extends State<DrawingScreen> {
                   }
                 });
               },
-              showLabel: true,
+              availableColors: [
+                Color(0xFF484848), // tundora
+                Color(0xFFC51A1F), // thunderbird
+                Color(0xFFF69F1C), // buttercup
+                Color(0xFFFFAA00), // subCard1
+                Color(0xFFA31AC5), // subCard3
+                Color(0xFF1AC5C5), // subCard4
+                Color(0xFFBE029F), // flirt
+                Color(0xFFAF23FF), // electricViolet
+                Color(0xFF4E3AFF), // electricBlue
+                Color(0xFF00B14D), // jade
+                Color(0xFF1AAEC5), // java
+                Color(0xFF08E200), // greenLight
+                Color(0xFFA4DE00), // rioGrande
+                Color(0xFFBFC51A), // keyLimePie
+                Color(0xFFC58C1A), // geebung
+                Color(0xFF973800), // brownLight
+                Color(0xFF00568F), // orient
+                Color(0xFFA9A9A9), // silverChalice
+              ],
             ),
           ),
           actions: [
@@ -94,167 +129,41 @@ class _DrawingScreenState extends State<DrawingScreen> {
     );
   }
 
-  Future<void> _saveAnnotatedImage() async {
-    final annotationImage = await _scribbleNotifier.renderImage();
-    if (_image != null) {
-      final decodedImage = img.decodeImage(await _image!.readAsBytes());
-      if (decodedImage != null) {
-        final annotation = img.decodeImage(annotationImage.buffer.asUint8List());
-
-        if (annotation != null) {
-          final resizedBackground = img.copyResize(decodedImage, width: 1690, height: 1075);
-          final resizedAnnotation = img.copyResize(annotation, width: 1690, height: 1075);
-
-          // Combine the resized background and annotation
-          img.copyInto(resizedBackground, resizedAnnotation, blend: true);
-
-          // Add text entries to the image
-          for (var textEntry in _texts) {
-            img.drawString(
-              resizedBackground,
-              img.arial_24,
-              (textEntry.position.dx * (1690 / decodedImage.width)).toInt(),
-              (textEntry.position.dy * (1075 / decodedImage.height)).toInt(),
-              textEntry.text,
-              color: img.getColor(textEntry.color.red, textEntry.color.green, textEntry.color.blue),
-            );
-          }
-
-          // Add shape entries to the image
-          for (var shape in _shapes) {
-            shape.paintShape(
-              resizedBackground,
-              img.getColor(shape.color.red, shape.color.green, shape.color.blue),
-              1690 / decodedImage.width,
-              1075 / decodedImage.height,
-            );
-          }
-
-          final directory = await getApplicationDocumentsDirectory();
-          final imagePath = '${directory.path}/annotated_image.png';
-          final imageFile = File(imagePath);
-          await imageFile.writeAsBytes(img.encodePng(resizedBackground));
-
-          // Show success message or handle the saved image as needed
-          showDialog(
-            context: context,
-            builder: (context) {
-              return AlertDialog(
-                content: Text('Annotated image saved successfully!'),
-                actions: [
-                  TextButton(
-                    onPressed: () {
-                      Navigator.of(context).pop();
-                    },
-                    child: Text('OK'),
-                  ),
-                ],
-              );
-            },
-          );
-        }
-      }
-    }
-  }
-
-  Future<void> _saveTransparentImage() async {
-    final annotationImage = await _scribbleNotifier.renderImage();
-    final canvas = img.Image(1690, 1075, channels: img.Channels.rgba);
-
-    if (_image != null) {
-      final decodedImage = img.decodeImage(await _image!.readAsBytes());
-      if (decodedImage != null) {
-        // Draw annotations onto the canvas
-        final annotation = img.decodeImage(annotationImage.buffer.asUint8List());
-        if (annotation != null) {
-          img.copyInto(canvas, annotation);
-        }
-
-        // Draw text entries onto the canvas
-        for (var textEntry in _texts) {
-          img.drawString(
-            canvas,
-            img.arial_24,
-            (textEntry.position.dx * (1690 / decodedImage.width)).toInt(),
-            (textEntry.position.dy * (1075 / decodedImage.height)).toInt(),
-            textEntry.text,
-            color: img.getColor(textEntry.color.red, textEntry.color.green, textEntry.color.blue),
-          );
-        }
-
-        // Draw shape entries onto the canvas
-        for (var shape in _shapes) {
-          shape.paintShape(
-            canvas,
-            img.getColor(shape.color.red, shape.color.green, shape.color.blue),
-            1690 / decodedImage.width,
-            1075 / decodedImage.height,
-          );
-        }
-
-        final directory = await getApplicationDocumentsDirectory();
-        final imagePath = '${directory.path}/transparent_image.png';
-        final imageFile = File(imagePath);
-        await imageFile.writeAsBytes(img.encodePng(canvas));
-
-        // Show success message or handle the saved image as needed
-        showDialog(
-          context: context,
-          builder: (context) {
-            return AlertDialog(
-              content: Text('Transparent image saved successfully!'),
-              actions: [
-                TextButton(
-                  onPressed: () {
-                    Navigator.of(context).pop();
-                  },
-                  child: Text('OK'),
-                ),
-              ],
-            );
-          },
-        );
-      }
-    }
-  }
-
-  void _toggleDrawEraseMode() {
-    setState(() {
-      _isDrawingMode = !_isDrawingMode;
-      if (_isDrawingMode) {
-        _scribbleNotifier.setColor(_currentColor);
-        _scribbleNotifier.setStrokeWidth(_strokeWidth);
-      } else {
-        _scribbleNotifier.setColor(Colors.transparent); // Erase by setting color to transparent
-      }
-    });
-  }
+  double _temporaryStrokeWidth = 3.0;
 
   void _pickStrokeWidth() {
+    _temporaryStrokeWidth = _strokeWidth;
     showDialog(
       context: context,
       builder: (context) {
         return AlertDialog(
           title: Text('Pick stroke width'),
-          content: Slider(
-            value: _strokeWidth,
-            min: 1.0,
-            max: 10.0,
-            divisions: 9,
-            label: _strokeWidth.round().toString(),
-            onChanged: (value) {
-              setState(() {
-                _strokeWidth = value;
-                _scribbleNotifier.setStrokeWidth(_strokeWidth);
-                if (_currentShapeInstance != null) {
-                  _currentShapeInstance!.strokeWidth = _strokeWidth;
-                }
-              });
+          content: StatefulBuilder(
+            builder: (BuildContext context, StateSetter setState) {
+              return Slider(
+                value: _temporaryStrokeWidth,
+                min: 1.0,
+                max: 10.0,
+                divisions: 9,
+                label: _temporaryStrokeWidth.round().toString(),
+                onChanged: (value) {
+                  setState(() {
+                    _temporaryStrokeWidth = value;
+                  });
+                },
+              );
             },
           ),
           actions: [
             TextButton(
               onPressed: () {
+                setState(() {
+                  _strokeWidth = _temporaryStrokeWidth;
+                  _scribbleNotifier.setStrokeWidth(_strokeWidth);
+                  if (_currentShapeInstance != null) {
+                    _currentShapeInstance!.strokeWidth = _strokeWidth;
+                  }
+                });
                 Navigator.of(context).pop();
               },
               child: Text('OK'),
@@ -266,15 +175,171 @@ class _DrawingScreenState extends State<DrawingScreen> {
   }
 
   void _undo() {
-    setState(() {
-      if (_texts.isNotEmpty) {
-        _texts.removeLast();
-      } else if (_shapes.isNotEmpty) {
-        _shapes.removeLast();
-      } else {
-        _scribbleNotifier.undo();
+    if (_actions.isNotEmpty) {
+      final lastAction = _actions.removeLast();
+
+      setState(() {
+        switch (lastAction.type) {
+          case "text":
+            _texts.remove(lastAction.object);
+            break;
+          case "shape":
+            _shapes.remove(lastAction.object);
+            break;
+          case "brush":
+            final lastShape = lastAction.object as _DrawnShape;
+            _shapes.remove(lastShape);
+            break;
+        }
+      });
+    }
+  }
+
+  void _showDialog(String title, String message) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: Text('OK'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _saveImage({required bool isTransparent}) async {
+    try {
+      final boundary = _repaintKey.currentContext?.findRenderObject()
+          as RenderRepaintBoundary?;
+      if (boundary != null) {
+        final image = await boundary.toImage(pixelRatio: 3.0);
+        final byteData = await image.toByteData(format: ImageByteFormat.png);
+        final pngBytes = byteData!.buffer.asUint8List();
+
+        // Get temporary directory
+        final dir = await getTemporaryDirectory();
+        final filename = '${dir.path}/image.png';
+        final file = File(filename);
+        await file.writeAsBytes(pngBytes);
+
+        img.Image finalImage;
+
+        if (isTransparent) {
+          // Create a blank transparent image with the same size
+          final img.Image originalImage = img.decodeImage(pngBytes)!;
+          final img.Image transparentImage = img.Image(
+              originalImage.width, originalImage.height,
+              channels: img.Channels.rgba);
+          img.fill(transparentImage,
+              img.getColor(0, 0, 0, 0)); // Make it transparent
+          img.copyInto(transparentImage, originalImage);
+
+          // Add text entries to the transparent image
+          for (var textEntry in _texts) {
+            final TextStyle style =
+                GoogleFonts.getFont(textEntry.fontFamily).copyWith(
+              fontSize: textEntry.fontSize,
+              color: textEntry.color,
+            );
+            final recorder = PictureRecorder();
+            final canvas = Canvas(recorder);
+            final textPainter = TextPainter(
+              text: TextSpan(text: textEntry.text, style: style),
+              textDirection: TextDirection.ltr,
+            );
+            textPainter.layout();
+            final offset = Offset(
+                textEntry.position.dx, textEntry.position.dy); // Apply position
+            textPainter.paint(canvas, offset);
+            final picture = recorder.endRecording();
+            final uiImage = await picture.toImage(
+                (textPainter.width + offset.dx).toInt(),
+                (textPainter.height + offset.dy).toInt());
+            final byteData =
+                await uiImage.toByteData(format: ImageByteFormat.png);
+            final textImage = img.decodeImage(byteData!.buffer.asUint8List())!;
+            img.copyInto(transparentImage, textImage,
+                dstX: (offset.dx * 3).toInt(),
+                dstY: (offset.dy * 3).toInt()); // Apply position
+          }
+
+          finalImage = transparentImage;
+        } else if (_image != null) {
+          // Combine the original image with the edited parts
+          final img.Image originalImage =
+              img.decodeImage(await _image!.readAsBytes())!;
+          final img.Image annotatedImage = img.decodeImage(pngBytes)!;
+          img.copyInto(originalImage, annotatedImage, blend: true);
+
+          // Add text entries to the annotated image
+          for (var textEntry in _texts) {
+            final TextStyle style =
+                GoogleFonts.getFont(textEntry.fontFamily).copyWith(
+              fontSize: textEntry.fontSize,
+              color: textEntry.color,
+            );
+            final recorder = PictureRecorder();
+            final canvas = Canvas(recorder);
+            final textPainter = TextPainter(
+              text: TextSpan(text: textEntry.text, style: style),
+              textDirection: TextDirection.ltr,
+            );
+            textPainter.layout();
+            final offset = Offset(
+                textEntry.position.dx, textEntry.position.dy); // Apply position
+            textPainter.paint(canvas, offset);
+            final picture = recorder.endRecording();
+            final uiImage = await picture.toImage(
+                (textPainter.width + offset.dx).toInt(),
+                (textPainter.height + offset.dy).toInt());
+            final byteData =
+                await uiImage.toByteData(format: ImageByteFormat.png);
+            final textImage = img.decodeImage(byteData!.buffer.asUint8List())!;
+            img.copyInto(originalImage, textImage,
+                dstX: (offset.dx * 3).toInt(),
+                dstY: (offset.dy * 3).toInt()); // Apply position
+          }
+
+          // Add shape entries to the image
+          for (var shape in _shapes) {
+            shape.paintShape(
+              originalImage,
+              img.getColor(
+                  shape.color.red, shape.color.green, shape.color.blue),
+              1.0, // Assuming no scaling is needed
+              1.0, // Assuming no scaling is needed
+            );
+          }
+
+          finalImage = originalImage;
+        } else {
+          final img.Image annotatedImage = img.decodeImage(pngBytes)!;
+          finalImage = annotatedImage;
+        }
+
+        final finalBytes = Uint8List.fromList(img.encodePng(finalImage));
+        await file.writeAsBytes(finalBytes);
+
+        // Save to gallery
+        final result = await ImageGallerySaver.saveFile(file.path);
+
+        _showDialog(
+            'Success',
+            result['isSuccess']
+                ? 'Image saved to gallery!'
+                : 'Failed to save image');
       }
-    });
+    } catch (e) {
+      _showDialog('Error', 'An error occurred while saving the image');
+    }
   }
 
   void _showSaveOptions() {
@@ -285,16 +350,16 @@ class _DrawingScreenState extends State<DrawingScreen> {
           title: Text('Save As'),
           children: [
             SimpleDialogOption(
-              onPressed: () {
+              onPressed: () async {
                 Navigator.of(context).pop();
-                _saveAnnotatedImage();
+                await _saveImage(isTransparent: false); // Save annotated image
               },
               child: Text('Annotated Image'),
             ),
             SimpleDialogOption(
-              onPressed: () {
+              onPressed: () async {
                 Navigator.of(context).pop();
-                _saveTransparentImage();
+                await _saveImage(isTransparent: true); // Save transparent image
               },
               child: Text('Transparent Image'),
             ),
@@ -305,18 +370,22 @@ class _DrawingScreenState extends State<DrawingScreen> {
   }
 
   void _addText(Offset position) {
+    final newText = _DrawnText(
+      text: "New Text",
+      color: _currentColor,
+      position: position, // Default position
+      size: Size(200, 50), // Default size
+    );
+
     setState(() {
-      _texts.add(_DrawnText(
-        text: "New Text",
-        color: _currentColor,
-        position: position, // Default position
-        size: Size(200, 50), // Default size
-      ));
+      _texts.add(newText);
+      _actions.add(EditAction(type: "text", object: newText));
     });
   }
 
   void _editText(_DrawnText text) {
-    TextEditingController textController = TextEditingController(text: text.text);
+    TextEditingController textController =
+        TextEditingController(text: text.text);
     String selectedFontFamily = text.fontFamily;
     double selectedFontSize = text.fontSize;
 
@@ -337,42 +406,47 @@ class _DrawingScreenState extends State<DrawingScreen> {
       builder: (context) {
         return AlertDialog(
           title: Text('Edit Text'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: textController,
-                decoration: InputDecoration(hintText: "Enter text"),
-              ),
-              DropdownButton<String>(
-                value: selectedFontFamily,
-                onChanged: (value) {
-                  setState(() {
-                    selectedFontFamily = value!;
-                  });
-                },
-                items: germanFonts.map((String font) {
-                  return DropdownMenuItem<String>(
-                    value: font,
-                    child: Text(font),
-                  );
-                }).toList(),
-              ),
-              DropdownButton<double>(
-                value: selectedFontSize,
-                onChanged: (value) {
-                  setState(() {
-                    selectedFontSize = value!;
-                  });
-                },
-                items: [16.0, 18.0, 20.0, 24.0, 30.0, 36.0, 48.0].map((double size) {
-                  return DropdownMenuItem<double>(
-                    value: size,
-                    child: Text(size.toString()),
-                  );
-                }).toList(),
-              ),
-            ],
+          content: StatefulBuilder(
+            builder: (BuildContext context, StateSetter setState) {
+              return Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextField(
+                    controller: textController,
+                    decoration: InputDecoration(hintText: "Enter text"),
+                  ),
+                  DropdownButton<String>(
+                    value: selectedFontFamily,
+                    onChanged: (value) {
+                      setState(() {
+                        selectedFontFamily = value!;
+                      });
+                    },
+                    items: germanFonts.map((String font) {
+                      return DropdownMenuItem<String>(
+                        value: font,
+                        child: Text(font),
+                      );
+                    }).toList(),
+                  ),
+                  DropdownButton<double>(
+                    value: selectedFontSize,
+                    onChanged: (value) {
+                      setState(() {
+                        selectedFontSize = value!;
+                      });
+                    },
+                    items: [16.0, 18.0, 20.0, 24.0, 30.0, 36.0, 48.0]
+                        .map((double size) {
+                      return DropdownMenuItem<double>(
+                        value: size,
+                        child: Text(size.toString()),
+                      );
+                    }).toList(),
+                  ),
+                ],
+              );
+            },
           ),
           actions: [
             TextButton(
@@ -402,16 +476,19 @@ class _DrawingScreenState extends State<DrawingScreen> {
   }
 
   void _addShape(String shape, Offset startPosition) {
+    final newShape = _DrawnShape(
+      shape: shape,
+      color: _currentColor,
+      startPosition: startPosition,
+      endPosition: startPosition,
+      strokeWidth: _strokeWidth,
+    );
+
     setState(() {
-      _currentShape = shape;
-      _currentShapeInstance = _DrawnShape(
-        shape: shape,
-        color: _currentColor,
-        startPosition: startPosition, // Default start position
-        endPosition: startPosition,   // Default end position
-        strokeWidth: _strokeWidth,
-      );
-      _shapes.add(_currentShapeInstance!);
+      _currentShapeInstance = newShape;
+      _shapes.add(newShape);
+      _actions.add(EditAction(
+          type: "shape", object: newShape)); // Record the shape action
     });
   }
 
@@ -420,12 +497,15 @@ class _DrawingScreenState extends State<DrawingScreen> {
       _scribbleNotifier.clear();
       _texts.clear();
       _shapes.clear();
+      _currentBrushStroke.clear();
+      _actions.clear();
     });
   }
 
   void _onTapOutside() {
     setState(() {
-      _currentShapeInstance = null; // Stop adjusting shapes when clicking outside
+      _currentShapeInstance =
+          null; // Stop adjusting shapes when clicking outside
     });
   }
 
@@ -513,22 +593,45 @@ class _DrawingScreenState extends State<DrawingScreen> {
         ),
         body: Stack(
           children: [
-            if (_image != null)
-              Center(child: Image.file(_image!)),
-            Scribble(
-              notifier: _scribbleNotifier,
-            ),
-            if (_isTextMode || _isShapeMode)
-              GestureDetector(
+            if (_image != null) Center(child: Image.file(_image!)),
+            Positioned.fill(
+              child: GestureDetector(
                 onPanStart: (details) {
                   if (_isShapeMode) {
                     _addShape(_currentShape, details.localPosition);
+                  } else if (_isDrawingMode) {
+                    setState(() {
+                      _currentBrushStroke = [details.localPosition];
+                    });
                   }
                 },
                 onPanUpdate: (details) {
                   if (_isShapeMode && _currentShapeInstance != null) {
                     setState(() {
-                      _currentShapeInstance!.endPosition = details.localPosition;
+                      _currentShapeInstance!.endPosition =
+                          details.localPosition;
+                    });
+                  } else if (_isDrawingMode) {
+                    setState(() {
+                      _currentBrushStroke.add(details.localPosition);
+                    });
+                  }
+                },
+                onPanEnd: (details) {
+                  if (_isDrawingMode) {
+                    setState(() {
+                      _shapes.add(_DrawnShape(
+                        shape:
+                            'line', // Using 'line' to represent freehand brush strokes
+                        color: _currentColor,
+                        startPosition: _currentBrushStroke.first,
+                        endPosition: _currentBrushStroke.last,
+                        strokeWidth: _strokeWidth,
+                        points: _currentBrushStroke,
+                      ));
+                      _currentBrushStroke = [];
+                      _actions
+                          .add(EditAction(type: "brush", object: _shapes.last));
                     });
                   }
                 },
@@ -537,112 +640,78 @@ class _DrawingScreenState extends State<DrawingScreen> {
                     _addText(details.localPosition);
                   }
                 },
-                child: Container(
-                  color: Colors.transparent,
+                child: RepaintBoundary(
+                  key: _repaintKey,
+                  child: CustomPaint(
+                    painter: ShapePainter(
+                      shapes: _shapes,
+                      currentShape: _currentShapeInstance,
+                      currentBrushStroke: _currentBrushStroke,
+                      strokeColor: _currentColor,
+                      strokeWidth: _strokeWidth,
+                    ),
+                    child: Container(),
+                  ),
                 ),
               ),
+            ),
             ..._texts.map((text) => Positioned(
-              left: text.position.dx,
-              top: text.position.dy,
-              child: GestureDetector(
-                onPanUpdate: (details) {
-                  setState(() {
-                    text.position = Offset(
-                      text.position.dx + details.delta.dx,
-                      text.position.dy + details.delta.dy,
-                    );
-                  });
-                },
-                onTap: () => _editText(text),
-                child: Container(
-                  width: text.size.width,
-                  height: text.size.height,
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.grey),
-                  ),
-                  child: Stack(
-                    children: [
-                      Positioned.fill(
-                        child: Align(
-                          alignment: Alignment.center,
-                          child: Text(
-                            text.text,
-                            style: GoogleFonts.getFont(
-                              text.fontFamily,
-                              color: text.color,
-                              fontSize: text.fontSize,
+                  left: text.position.dx,
+                  top: text.position.dy,
+                  child: GestureDetector(
+                    onPanUpdate: (details) {
+                      setState(() {
+                        text.position = Offset(
+                          text.position.dx + details.delta.dx,
+                          text.position.dy + details.delta.dy,
+                        );
+                      });
+                    },
+                    onTap: () => _editText(text),
+                    child: Container(
+                      width: text.size.width,
+                      height: text.size.height,
+                      decoration: BoxDecoration(
+                        border: Border.all(color: Colors.grey),
+                      ),
+                      child: Stack(
+                        children: [
+                          Positioned.fill(
+                            child: Align(
+                              alignment: Alignment.center,
+                              child: Text(
+                                text.text,
+                                style: GoogleFonts.getFont(
+                                  text.fontFamily,
+                                  color: text.color,
+                                  fontSize: text.fontSize,
+                                ),
+                              ),
                             ),
                           ),
-                        ),
-                      ),
-                      Positioned(
-                        right: 0,
-                        bottom: 0,
-                        child: GestureDetector(
-                          onPanUpdate: (details) {
-                            setState(() {
-                              text.size = Size(
-                                text.size.width + details.delta.dx,
-                                text.size.height + details.delta.dy,
-                              );
-                            });
-                          },
-                          child: Icon(
-                            Icons.open_with,
-                            color: Colors.blue,
+                          Positioned(
+                            right: 0,
+                            bottom: 0,
+                            child: GestureDetector(
+                              onPanUpdate: (details) {
+                                setState(() {
+                                  text.size = Size(
+                                    text.size.width + details.delta.dx,
+                                    text.size.height + details.delta.dy,
+                                  );
+                                });
+                              },
+                              child: Icon(
+                                Icons.open_with,
+                                color: Colors.blue,
+                              ),
+                            ),
                           ),
-                        ),
+                        ],
                       ),
-                    ],
+                    ),
                   ),
-                ),
-              ),
-            )),
-            ..._shapes.map((shape) => Positioned(
-              left: shape.startPosition.dx,
-              top: shape.startPosition.dy,
-              child: GestureDetector(
-                onPanUpdate: (details) {
-                  setState(() {
-                    shape.endPosition = Offset(
-                      shape.endPosition.dx + details.delta.dx,
-                      shape.endPosition.dy + details.delta.dy,
-                    );
-                  });
-                },
-                onTap: () {
-                  setState(() {
-                    _currentShapeInstance = shape;
-                  });
-                },
-                child: CustomPaint(
-                  painter: ShapePainter(shape),
-                  child: _currentShapeInstance == shape
-                      ? Stack(
-                    children: List.generate(4, (index) {
-                      final offset = _getCornerOffset(shape, index);
-                      return Positioned(
-                        left: offset.dx - 5,
-                        top: offset.dy - 5,
-                        child: GestureDetector(
-                          onPanUpdate: (details) {
-                            setState(() {
-                              _resizeShape(shape, index, details.delta);
-                            });
-                          },
-                          child: Container(
-                            width: 10,
-                            height: 10,
-                            color: Colors.blue,
-                          ),
-                        ),
-                      );
-                    }),
-                  )
-                      : Container(),
-                ),
-              ),
-            )),
+                )),
           ],
         ),
         floatingActionButton: FloatingActionButton(
@@ -652,38 +721,6 @@ class _DrawingScreenState extends State<DrawingScreen> {
         ),
       ),
     );
-  }
-
-  Offset _getCornerOffset(_DrawnShape shape, int cornerIndex) {
-    switch (cornerIndex) {
-      case 0:
-        return shape.startPosition;
-      case 1:
-        return Offset(shape.endPosition.dx, shape.startPosition.dy);
-      case 2:
-        return shape.endPosition;
-      case 3:
-        return Offset(shape.startPosition.dx, shape.endPosition.dy);
-      default:
-        return shape.startPosition;
-    }
-  }
-
-  void _resizeShape(_DrawnShape shape, int cornerIndex, Offset delta) {
-    switch (cornerIndex) {
-      case 0:
-        shape.startPosition += delta;
-        break;
-      case 1:
-        shape.endPosition = Offset(shape.endPosition.dx + delta.dx, shape.startPosition.dy + delta.dy);
-        break;
-      case 2:
-        shape.endPosition += delta;
-        break;
-      case 3:
-        shape.endPosition = Offset(shape.startPosition.dx + delta.dx, shape.endPosition.dy + delta.dy);
-        break;
-    }
   }
 }
 
@@ -711,6 +748,7 @@ class _DrawnShape {
   Offset startPosition;
   Offset endPosition;
   double strokeWidth;
+  List<Offset>? points;
 
   _DrawnShape({
     required this.shape,
@@ -718,6 +756,7 @@ class _DrawnShape {
     required this.startPosition,
     required this.endPosition,
     required this.strokeWidth,
+    this.points,
   });
 
   get rect => Rect.fromPoints(startPosition, endPosition);
@@ -741,21 +780,30 @@ class _DrawnShape {
     for (int i = 0; i < strokeWidth.toInt(); i++) {
       switch (shape) {
         case 'line':
-          img.drawLine(image, scaledStartX + i, scaledStartY + i, scaledEndX + i, scaledEndY + i, color);
+          if (points != null) {
+            for (int i = 0; i < points!.length - 1; i++) {
+              img.drawLine(image, points![i].dx.toInt(), points![i].dy.toInt(),
+                  points![i + 1].dx.toInt(), points![i + 1].dy.toInt(), color);
+            }
+          }
           break;
         case 'circle':
           img.drawCircle(image, centerX, centerY, radius + i, color);
           break;
         case 'rectangle':
-          img.drawRect(image, scaledStartX + i, scaledStartY + i, scaledEndX - i, scaledEndY - i, color);
+          img.drawRect(image, scaledStartX + i, scaledStartY + i,
+              scaledEndX - i, scaledEndY - i, color);
           break;
         case 'square':
-          int size = rect.width < rect.height ? rect.width.toInt() : rect.height.toInt();
+          int size = rect.width < rect.height
+              ? rect.width.toInt()
+              : rect.height.toInt();
           int squareStartX = (rect.center.dx - size / 2).toInt();
           int squareStartY = (rect.center.dy - size / 2).toInt();
           int squareEndX = (rect.center.dx + size / 2).toInt();
           int squareEndY = (rect.center.dy + size / 2).toInt();
-          img.drawRect(image, squareStartX + i, squareStartY + i, squareEndX - i, squareEndY - i, color);
+          img.drawRect(image, squareStartX + i, squareStartY + i,
+              squareEndX - i, squareEndY - i, color);
           break;
       }
     }
@@ -763,33 +811,107 @@ class _DrawnShape {
 }
 
 class ShapePainter extends CustomPainter {
-  final _DrawnShape shape;
+  final List<_DrawnShape> shapes;
+  final _DrawnShape? currentShape;
+  final List<Offset> currentBrushStroke;
+  final Color strokeColor;
+  final double strokeWidth;
 
-  ShapePainter(this.shape);
+  ShapePainter({
+    required this.shapes,
+    this.currentShape,
+    required this.currentBrushStroke,
+    required this.strokeColor,
+    required this.strokeWidth,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = shape.color
-      ..strokeWidth = shape.strokeWidth
-      ..style = PaintingStyle.stroke;
+      ..color = strokeColor
+      ..strokeWidth = strokeWidth
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round;
 
-    if (shape.shape == 'line') {
-      canvas.drawLine(shape.startPosition, shape.endPosition, paint);
-    } else if (shape.shape == 'rectangle') {
-      canvas.drawRect(
-        Rect.fromPoints(shape.startPosition, shape.endPosition),
-        paint,
-      );
-    } else if (shape.shape == 'circle') {
-      final radius = (shape.endPosition - shape.startPosition).distance / 2;
-      final center = (shape.startPosition + shape.endPosition) / 2;
-      canvas.drawCircle(center, radius, paint);
-    } else if (shape.shape == 'square') {
-      final size = (shape.endPosition - shape.startPosition).distance;
-      final center = (shape.startPosition + shape.endPosition) / 2;
-      final squareRect = Rect.fromCenter(center: center, width: size, height: size);
-      canvas.drawRect(squareRect, paint);
+    for (final shape in shapes) {
+      final shapePaint = Paint()
+        ..color = shape.color
+        ..strokeWidth = shape.strokeWidth
+        ..style = PaintingStyle.stroke;
+
+      final rect = Rect.fromPoints(shape.startPosition, shape.endPosition);
+
+      switch (shape.shape) {
+        case 'line':
+          if (shape.points != null) {
+            final path = Path()
+              ..moveTo(shape.points!.first.dx, shape.points!.first.dy);
+            for (final point in shape.points!) {
+              path.lineTo(point.dx, point.dy);
+            }
+            canvas.drawPath(path, shapePaint);
+          } else {
+            canvas.drawLine(shape.startPosition, shape.endPosition, shapePaint);
+          }
+          break;
+        case 'circle':
+          final radius = (shape.endPosition - shape.startPosition).distance / 2;
+          final center = (shape.startPosition + shape.endPosition) / 2;
+          canvas.drawCircle(center, radius, shapePaint);
+          break;
+        case 'rectangle':
+          canvas.drawRect(rect, shapePaint);
+          break;
+        case 'square':
+          final size = (shape.endPosition - shape.startPosition).distance;
+          final center = (shape.startPosition + shape.endPosition) / 2;
+          final squareRect =
+              Rect.fromCenter(center: center, width: size, height: size);
+          canvas.drawRect(squareRect, shapePaint);
+          break;
+      }
+    }
+
+    if (currentShape != null) {
+      final rect = Rect.fromPoints(
+          currentShape!.startPosition, currentShape!.endPosition);
+
+      switch (currentShape!.shape) {
+        case 'line':
+          canvas.drawLine(
+              currentShape!.startPosition, currentShape!.endPosition, paint);
+          break;
+        case 'circle':
+          final radius =
+              (currentShape!.endPosition - currentShape!.startPosition)
+                      .distance /
+                  2;
+          final center =
+              (currentShape!.startPosition + currentShape!.endPosition) / 2;
+          canvas.drawCircle(center, radius, paint);
+          break;
+        case 'rectangle':
+          canvas.drawRect(rect, paint);
+          break;
+        case 'square':
+          final size = (currentShape!.endPosition - currentShape!.startPosition)
+              .distance;
+          final center =
+              (currentShape!.startPosition + currentShape!.endPosition) / 2;
+          final squareRect =
+              Rect.fromCenter(center: center, width: size, height: size);
+          canvas.drawRect(squareRect, paint);
+          break;
+      }
+    }
+
+    if (currentBrushStroke.isNotEmpty) {
+      final path = Path()
+        ..moveTo(currentBrushStroke.first.dx, currentBrushStroke.first.dy);
+      for (final point in currentBrushStroke) {
+        path.lineTo(point.dx, point.dy);
+      }
+      canvas.drawPath(path, paint);
     }
   }
 
