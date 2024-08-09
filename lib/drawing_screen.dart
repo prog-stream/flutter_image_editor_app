@@ -1,380 +1,451 @@
-import 'dart:typed_data';
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
-import 'package:image_picker/image_picker.dart';
-import 'package:scribble/scribble.dart';
-import 'package:flutter_colorpicker/flutter_colorpicker.dart';
 import 'dart:io';
+import 'dart:typed_data';
+import 'dart:ui' as ui;
 import 'package:path_provider/path_provider.dart';
-import 'package:image/image.dart' as img;
+import 'package:flutter_colorpicker/flutter_colorpicker.dart';
+import 'package:path/path.dart' as path;
 import 'package:google_fonts/google_fonts.dart';
-import 'package:image_gallery_saver/image_gallery_saver.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:gallery_saver/gallery_saver.dart';
 
-class DrawingScreen extends StatefulWidget {
-  final File? image;
+enum ShapeType { Line, Ellipse, Circle, Square, Rectangle }
 
-  DrawingScreen({this.image});
+class ImageEditorScreen extends StatefulWidget {
+  final File image;
+  final String imageName;
+  final bool? readOnly;
+
+  ImageEditorScreen({
+    required this.image,
+    required this.imageName,
+    this.readOnly,
+  });
 
   @override
-  _DrawingScreenState createState() => _DrawingScreenState();
+  _ImageEditorScreenState createState() => _ImageEditorScreenState();
 }
 
-List<EditAction> _actions = [];
-
-class EditAction {
-  final String type; // "text", "shape", or "brush"
-  final dynamic object; // The actual text, shape, or brush stroke
-
-  EditAction({required this.type, required this.object});
-}
-
-class _DrawingScreenState extends State<DrawingScreen> {
-  final ScribbleNotifier _scribbleNotifier = ScribbleNotifier();
-  File? _image;
-  bool _isDrawingMode = true;
-  bool _isTextMode = false;
-  bool _isShapeMode = false;
-  String _currentShape = 'line';
-  Color _currentColor = Colors.black;
+class _ImageEditorScreenState extends State<ImageEditorScreen> {
+  ui.Image? _image;
+  bool _isLoaded = false;
+  final GlobalKey _globalKey = GlobalKey();
+  Color _selectedColor = Colors.red;
   double _strokeWidth = 3.0;
-  final GlobalKey _repaintKey = GlobalKey();
-
+  ShapeType? _selectedShapeType;
+  String? _selectedTool;
+  Shape? _currentShape;
+  Shape? _selectedShape;
+  Offset? _dragStart;
+  bool _isDragging = false;
+  List<Shape> _shapes = [];
+  List<Stroke> _strokes = [];
   List<_DrawnText> _texts = [];
-  List<_DrawnShape> _shapes = [];
-  List<Offset> _currentBrushStroke = [];
   _DrawnText? _selectedText;
-  _DrawnShape? _currentShapeInstance;
+  Offset? _dragStartText;
+  List<EditAction> _actions = [];
+  double _scaleFactor = 1.0;
 
   @override
   void initState() {
     super.initState();
-    _image = widget.image;
+    _loadImage();
   }
 
-  void _activateDrawingMode() {
+  Future<void> _loadImage() async {
+    if (widget.imageName == 'transparent_image') {
+      final width = 1080;
+      final height = 1920;
+      final recorder = ui.PictureRecorder();
+      final canvas = Canvas(
+          recorder,
+          Rect.fromPoints(
+              Offset(0, 0), Offset(width.toDouble(), height.toDouble())));
+      final paint = Paint()..color = Colors.transparent;
+      canvas.drawRect(
+          Rect.fromLTWH(0, 0, width.toDouble(), height.toDouble()), paint);
+      final picture = recorder.endRecording();
+      final image = await picture.toImage(width, height);
+
+      setState(() {
+        _image = image;
+        _isLoaded = true;
+      });
+    } else {
+      final data = await widget.image.readAsBytes();
+      final image = await decodeImageFromList(data);
+      setState(() {
+        _image = image;
+        _isLoaded = true;
+        _scaleFactor = _calculateScaleFactor(
+            image.width.toDouble(), image.height.toDouble());
+      });
+    }
+  }
+
+  double _calculateScaleFactor(double imageWidth, double imageHeight) {
+    final screenSize = MediaQuery.of(context).size;
+    final screenWidth = screenSize.width;
+    final screenHeight = screenSize.height -
+        200; // Adjust as needed for toolbar and other UI elements
+
+    final widthFactor = screenWidth / imageWidth;
+    final heightFactor = screenHeight / imageHeight;
+
+    return widthFactor < heightFactor ? widthFactor : heightFactor;
+  }
+
+  Offset _scalePosition(Offset position) {
+    return position / _scaleFactor!;
+  }
+
+  Future<String> _getUniqueFilePath(String baseName, String extension) async {
+    final directory = await getApplicationDocumentsDirectory();
+    int counter = 1;
+    String filePath;
+    do {
+      filePath = path.join(directory.path,
+          '$baseName${counter.toString().padLeft(6, '0')}.$extension');
+      counter++;
+    } while (await File(filePath).exists());
+    return filePath;
+  }
+
+  Future<void> _saveImage() async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Save Image'),
+        content: Text(
+            "Once Saved, you can't edit it again. Do you want to continue?"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text('No'),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.of(context).pop(true);
+            },
+            child: Text('Yes'),
+          ),
+        ],
+      ),
+    );
+
+    if (result == true) {
+      RenderRepaintBoundary boundary = _globalKey.currentContext!
+          .findRenderObject() as RenderRepaintBoundary;
+      ui.Image image = await boundary.toImage();
+      ByteData? byteData =
+          await image.toByteData(format: ui.ImageByteFormat.png);
+      Uint8List pngBytes = byteData!.buffer.asUint8List();
+
+      final imagePath = await _getUniqueFilePath(widget.imageName, 'png');
+      final imageFile = File(imagePath);
+      await imageFile.writeAsBytes(pngBytes);
+
+      if (await Permission.storage.request().isGranted) {
+        if (Platform.isAndroid) {
+          await GallerySaver.saveImage(imageFile.path,
+              albumName: "DDC Drawing");
+        } else if (Platform.isIOS) {
+          await GallerySaver.saveImage(imageFile.path);
+        }
+
+        await showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: Text('Success'),
+            content: Text('Image Saved Successfully'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: Text('OK'),
+              ),
+            ],
+          ),
+        );
+      }
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Image saved to $imagePath')),
+      );
+
+      Navigator.pop(context, imagePath);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Edit Image'),
+        leading: Tooltip(
+          message: 'Back',
+          child: MouseRegion(
+            onEnter: (_) => setState(() {}),
+            onExit: (_) => setState(() {}),
+            child: IconButton(
+              icon: Icon(Icons.arrow_back),
+              onPressed: () async {
+                final result = await showDialog<bool>(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: Text('Unsaved Changes'),
+                    content:
+                        Text('Do you want to discard your changes and exit?'),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.of(context).pop(false),
+                        child: Text('No'),
+                      ),
+                      TextButton(
+                        onPressed: () => Navigator.of(context).pop(true),
+                        child: Text('Yes'),
+                      ),
+                    ],
+                  ),
+                );
+
+                if (result == true) {
+                  Navigator.of(context).pop();
+                }
+              },
+              hoverColor: Colors.blue[200], // Change color on hover
+            ),
+          ),
+        ),
+        actions: [
+          Tooltip(
+            message: 'Save',
+            child: MouseRegion(
+              onEnter: (_) => setState(() {}),
+              onExit: (_) => setState(() {}),
+              child: IconButton(
+                icon: Icon(Icons.save),
+                onPressed: _saveImage,
+                hoverColor: Colors.blue[200], // Change color on hover
+              ),
+            ),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: Center(
+              child: _isLoaded
+                  ? Listener(
+                      onPointerDown: (details) {
+                        if (_selectedTool == 'brush') {
+                          _addStroke(details.localPosition);
+                        } else if (_selectedTool == 'shape') {
+                          _selectShape(details.localPosition);
+                        } else if (_selectedTool == 'text') {
+                          _selectText(details.localPosition);
+                        }
+                      },
+                      onPointerMove: (details) {
+                        if (_selectedTool == 'brush') {
+                          _addStroke(details.localPosition);
+                        } else if (_selectedTool == 'shape') {
+                          if (_currentShape != null) {
+                            _updateShape(details.localPosition);
+                          } else if (_isDragging) {
+                            _moveShape(details.localPosition);
+                          }
+                        } else if (_isDragging) {
+                          _moveShape(details.localPosition);
+                        } else if (_selectedText != null) {
+                          _moveText(details.localPosition);
+                        }
+                      },
+                      onPointerUp: (details) {
+                        if (_selectedTool == 'brush') {
+                          setState(() {
+                            _strokes.add(Stroke(
+                                color: _selectedColor,
+                                strokeWidth: _strokeWidth));
+                          });
+                        } else if (_selectedTool == 'shape') {
+                          _endShape();
+                        } else {
+                          setState(() {
+                            _isDragging = false;
+                            _dragStartText = null;
+                          });
+                        }
+                      },
+                      child: GestureDetector(
+                        onTapUp: (details) {
+                          _onTap(details.localPosition);
+                        },
+                        child: ClipRect(
+                          child: RepaintBoundary(
+                            key: _globalKey,
+                            child: CustomPaint(
+                              painter: ImagePainter(
+                                image: _image!,
+                                strokes: _strokes,
+                                color: _selectedColor,
+                                strokeWidth: _strokeWidth,
+                                shapes: _shapes,
+                                texts: _texts,
+                                selectedShape: _selectedShape,
+                                selectedText: _selectedText,
+                                scaleFactor: _scaleFactor,
+                                isSaving: false,
+                              ),
+                              child: Container(
+                                width: _image!.width.toDouble() * _scaleFactor!,
+                                height:
+                                    _image!.height.toDouble() * _scaleFactor!,
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    )
+                  : CircularProgressIndicator(),
+            ),
+          ),
+          _buildToolbar(),
+        ],
+      ),
+    );
+  }
+
+  void _clearAll() async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Clear All'),
+        content: Text('Do you really want to discard all changes?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text('No'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text('Yes'),
+          ),
+        ],
+      ),
+    );
+
+    if (result == true) {
+      setState(() {
+        _strokes.clear();
+        _shapes.clear();
+        _texts.clear();
+        _actions.clear();
+      });
+    }
+  }
+
+  void _selectTool(String? tool) {
     setState(() {
-      _isDrawingMode = true;
-      _isTextMode = false;
-      _isShapeMode = false;
-      _currentShapeInstance = null; // Stop adjusting shapes
-      _scribbleNotifier.setColor(_currentColor);
-      _scribbleNotifier.setStrokeWidth(_strokeWidth);
+      _selectedTool = tool;
+      if (tool != 'shape') {
+        _selectedShapeType = null; // Deselect shape when changing tool
+      }
+      _selectedShape = null; // Deselect shape when changing tool
+      _selectedText = null; // Deselect text when changing tool
     });
   }
 
-  Future<void> _pickImage() async {
-    final pickedFile =
-        await ImagePicker().pickImage(source: ImageSource.gallery);
-    if (pickedFile != null) {
+  void _selectShapeType(ShapeType? type) {
+    setState(() {
+      _selectedShapeType = type;
+      _selectTool('shape');
+    });
+  }
+
+  void _startShape(Offset start) {
+    if (_selectedShapeType != null) {
       setState(() {
-        _image = File(pickedFile.path);
+        _currentShape = Shape(
+          type: _selectedShapeType!,
+          start: _scalePosition(start),
+          end: _scalePosition(start),
+          color: _selectedColor,
+          strokeWidth: _strokeWidth,
+        );
+        _shapes.add(_currentShape!);
+        _actions.add(EditAction(type: "shape", object: _currentShape!));
       });
     }
   }
 
-  void _pickColor() {
-    showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: Text('Pick a color'),
-          content: SingleChildScrollView(
-            child: BlockPicker(
-              pickerColor: _currentColor,
-              onColorChanged: (color) {
-                setState(() {
-                  _currentColor = color;
-                  _scribbleNotifier.setColor(_currentColor);
-                  if (_selectedText != null) {
-                    _selectedText!.color = _currentColor;
-                  }
-                  if (_currentShapeInstance != null) {
-                    _currentShapeInstance!.color = _currentColor;
-                  }
-                });
-              },
-              availableColors: [
-                Color(0xFF484848), // tundora
-                Color(0xFFC51A1F), // thunderbird
-                Color(0xFFF69F1C), // buttercup
-                Color(0xFFFFAA00), // subCard1
-                Color(0xFFA31AC5), // subCard3
-                Color(0xFF1AC5C5), // subCard4
-                Color(0xFFBE029F), // flirt
-                Color(0xFFAF23FF), // electricViolet
-                Color(0xFF4E3AFF), // electricBlue
-                Color(0xFF00B14D), // jade
-                Color(0xFF1AAEC5), // java
-                Color(0xFF08E200), // greenLight
-                Color(0xFFA4DE00), // rioGrande
-                Color(0xFFBFC51A), // keyLimePie
-                Color(0xFFC58C1A), // geebung
-                Color(0xFF973800), // brownLight
-                Color(0xFF00568F), // orient
-                Color(0xFFA9A9A9), // silverChalice
-              ],
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
-              child: Text('OK'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  double _temporaryStrokeWidth = 3.0;
-
-  void _pickStrokeWidth() {
-    _temporaryStrokeWidth = _strokeWidth;
-    showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: Text('Pick stroke width'),
-          content: StatefulBuilder(
-            builder: (BuildContext context, StateSetter setState) {
-              return Slider(
-                value: _temporaryStrokeWidth,
-                min: 1.0,
-                max: 10.0,
-                divisions: 9,
-                label: _temporaryStrokeWidth.round().toString(),
-                onChanged: (value) {
-                  setState(() {
-                    _temporaryStrokeWidth = value;
-                  });
-                },
-              );
-            },
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                setState(() {
-                  _strokeWidth = _temporaryStrokeWidth;
-                  _scribbleNotifier.setStrokeWidth(_strokeWidth);
-                  if (_currentShapeInstance != null) {
-                    _currentShapeInstance!.strokeWidth = _strokeWidth;
-                  }
-                });
-                Navigator.of(context).pop();
-              },
-              child: Text('OK'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _undo() {
-    if (_actions.isNotEmpty) {
-      final lastAction = _actions.removeLast();
-
-      setState(() {
-        switch (lastAction.type) {
-          case "text":
-            _texts.remove(lastAction.object);
-            break;
-          case "shape":
-            _shapes.remove(lastAction.object);
-            break;
-          case "brush":
-            final lastShape = lastAction.object as _DrawnShape;
-            _shapes.remove(lastShape);
-            break;
-        }
-      });
-    }
-  }
-
-  void _showDialog(String title, String message) {
-    showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: Text(title),
-          content: Text(message),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
-              child: Text('OK'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  Future<void> _saveImage({required bool isTransparent}) async {
-    try {
-      final boundary = _repaintKey.currentContext?.findRenderObject()
-          as RenderRepaintBoundary?;
-      if (boundary != null) {
-        final image = await boundary.toImage(pixelRatio: 3.0);
-        final byteData = await image.toByteData(format: ImageByteFormat.png);
-        final pngBytes = byteData!.buffer.asUint8List();
-
-        // Get temporary directory
-        final dir = await getTemporaryDirectory();
-        final filename = '${dir.path}/image.png';
-        final file = File(filename);
-        await file.writeAsBytes(pngBytes);
-
-        img.Image finalImage;
-
-        if (isTransparent) {
-          // Create a blank transparent image with the same size
-          final img.Image originalImage = img.decodeImage(pngBytes)!;
-          final img.Image transparentImage = img.Image(
-              originalImage.width, originalImage.height,
-              channels: img.Channels.rgba);
-          img.fill(transparentImage,
-              img.getColor(0, 0, 0, 0)); // Make it transparent
-          img.copyInto(transparentImage, originalImage);
-
-          // Add text entries to the transparent image
-          for (var textEntry in _texts) {
-            final TextStyle style =
-                GoogleFonts.getFont(textEntry.fontFamily).copyWith(
-              fontSize: textEntry.fontSize,
-              color: textEntry.color,
-            );
-            final recorder = PictureRecorder();
-            final canvas = Canvas(recorder);
-            final textPainter = TextPainter(
-              text: TextSpan(text: textEntry.text, style: style),
-              textDirection: TextDirection.ltr,
-            );
-            textPainter.layout();
-            final offset = Offset(
-                textEntry.position.dx, textEntry.position.dy); // Apply position
-            textPainter.paint(canvas, offset);
-            final picture = recorder.endRecording();
-            final uiImage = await picture.toImage(
-                (textPainter.width + offset.dx).toInt(),
-                (textPainter.height + offset.dy).toInt());
-            final byteData =
-                await uiImage.toByteData(format: ImageByteFormat.png);
-            final textImage = img.decodeImage(byteData!.buffer.asUint8List())!;
-            img.copyInto(transparentImage, textImage,
-                dstX: (offset.dx * 3).toInt(),
-                dstY: (offset.dy * 3).toInt()); // Apply position
-          }
-
-          finalImage = transparentImage;
-        } else if (_image != null) {
-          // Combine the original image with the edited parts
-          final img.Image originalImage =
-              img.decodeImage(await _image!.readAsBytes())!;
-          final img.Image annotatedImage = img.decodeImage(pngBytes)!;
-          img.copyInto(originalImage, annotatedImage, blend: true);
-
-          // Add text entries to the annotated image
-          for (var textEntry in _texts) {
-            final TextStyle style =
-                GoogleFonts.getFont(textEntry.fontFamily).copyWith(
-              fontSize: textEntry.fontSize,
-              color: textEntry.color,
-            );
-            final recorder = PictureRecorder();
-            final canvas = Canvas(recorder);
-            final textPainter = TextPainter(
-              text: TextSpan(text: textEntry.text, style: style),
-              textDirection: TextDirection.ltr,
-            );
-            textPainter.layout();
-            final offset = Offset(
-                textEntry.position.dx, textEntry.position.dy); // Apply position
-            textPainter.paint(canvas, offset);
-            final picture = recorder.endRecording();
-            final uiImage = await picture.toImage(
-                (textPainter.width + offset.dx).toInt(),
-                (textPainter.height + offset.dy).toInt());
-            final byteData =
-                await uiImage.toByteData(format: ImageByteFormat.png);
-            final textImage = img.decodeImage(byteData!.buffer.asUint8List())!;
-            img.copyInto(originalImage, textImage,
-                dstX: (offset.dx * 3).toInt(),
-                dstY: (offset.dy * 3).toInt()); // Apply position
-          }
-
-          // Add shape entries to the image
-          for (var shape in _shapes) {
-            shape.paintShape(
-              originalImage,
-              img.getColor(
-                  shape.color.red, shape.color.green, shape.color.blue),
-              1.0, // Assuming no scaling is needed
-              1.0, // Assuming no scaling is needed
-            );
-          }
-
-          finalImage = originalImage;
-        } else {
-          final img.Image annotatedImage = img.decodeImage(pngBytes)!;
-          finalImage = annotatedImage;
-        }
-
-        final finalBytes = Uint8List.fromList(img.encodePng(finalImage));
-        await file.writeAsBytes(finalBytes);
-
-        // Save to gallery
-        final result = await ImageGallerySaver.saveFile(file.path);
-
-        _showDialog(
-            'Success',
-            result['isSuccess']
-                ? 'Image saved to gallery!'
-                : 'Failed to save image');
+  void _updateShape(Offset current) {
+    setState(() {
+      if (_currentShape != null) {
+        _currentShape!.end = _scalePosition(current);
       }
-    } catch (e) {
-      _showDialog('Error', 'An error occurred while saving the image');
+    });
+  }
+
+  void _endShape() {
+    setState(() {
+      _currentShape = null;
+    });
+  }
+
+  void _addStroke(Offset point) {
+    setState(() {
+      if (_strokes.isEmpty || _strokes.last.points.isEmpty) {
+        _strokes.add(Stroke(color: _selectedColor, strokeWidth: _strokeWidth));
+        _actions.add(EditAction(type: "stroke", object: _strokes.last));
+      }
+      _strokes.last.points.add(_scalePosition(point));
+    });
+  }
+
+  void _selectShape(Offset position) {
+    for (var shape in _shapes) {
+      if (shape.contains(_scalePosition(position))) {
+        setState(() {
+          _selectedShape = shape;
+          _dragStart = _scalePosition(position);
+          _isDragging = true;
+        });
+        return;
+      }
+    }
+
+    // If no shape was selected, add new shape
+    if (_selectedTool == 'shape' && _selectedShapeType != null) {
+      _startShape(position);
     }
   }
 
-  void _showSaveOptions() {
-    showDialog(
-      context: context,
-      builder: (context) {
-        return SimpleDialog(
-          title: Text('Save As'),
-          children: [
-            SimpleDialogOption(
-              onPressed: () async {
-                Navigator.of(context).pop();
-                await _saveImage(isTransparent: false); // Save annotated image
-              },
-              child: Text('Annotated Image'),
-            ),
-            SimpleDialogOption(
-              onPressed: () async {
-                Navigator.of(context).pop();
-                await _saveImage(isTransparent: true); // Save transparent image
-              },
-              child: Text('Transparent Image'),
-            ),
-          ],
-        );
-      },
-    );
+  void _moveShape(Offset position) {
+    if (_selectedShape != null && _dragStart != null) {
+      setState(() {
+        Offset offset = _scalePosition(position) - _dragStart!;
+        _selectedShape!.start += offset;
+        _selectedShape!.end += offset;
+        _dragStart = _scalePosition(position);
+      });
+    }
+  }
+
+  void _deselectShape() {
+    setState(() {
+      _selectedShape = null;
+    });
   }
 
   void _addText(Offset position) {
     final newText = _DrawnText(
       text: "New Text",
-      color: _currentColor,
-      position: position, // Default position
-      size: Size(200, 50), // Default size
+      color: _selectedColor,
+      position: _scalePosition(position),
+      size: Size(300, 75),
+      fontSize: 20.0,
     );
 
     setState(() {
@@ -389,7 +460,7 @@ class _DrawingScreenState extends State<DrawingScreen> {
     String selectedFontFamily = text.fontFamily;
     double selectedFontSize = text.fontSize;
 
-    List<String> germanFonts = [
+    List<String> fonts = [
       'Anton',
       'Bangers',
       'Fredericka the Great',
@@ -405,11 +476,12 @@ class _DrawingScreenState extends State<DrawingScreen> {
       context: context,
       builder: (context) {
         return AlertDialog(
+          scrollable: true,
           title: Text('Edit Text'),
           content: StatefulBuilder(
             builder: (BuildContext context, StateSetter setState) {
               return Column(
-                mainAxisSize: MainAxisSize.min,
+                mainAxisSize: MainAxisSize.max,
                 children: [
                   TextField(
                     controller: textController,
@@ -422,7 +494,7 @@ class _DrawingScreenState extends State<DrawingScreen> {
                         selectedFontFamily = value!;
                       });
                     },
-                    items: germanFonts.map((String font) {
+                    items: fonts.map((String font) {
                       return DropdownMenuItem<String>(
                         value: font,
                         child: Text(font),
@@ -436,8 +508,17 @@ class _DrawingScreenState extends State<DrawingScreen> {
                         selectedFontSize = value!;
                       });
                     },
-                    items: [16.0, 18.0, 20.0, 24.0, 30.0, 36.0, 48.0]
-                        .map((double size) {
+                    items: [
+                      16.0,
+                      18.0,
+                      20.0,
+                      24.0,
+                      30.0,
+                      36.0,
+                      48.0,
+                      60.0,
+                      72.0
+                    ].map((double size) {
                       return DropdownMenuItem<double>(
                         value: size,
                         child: Text(size.toString()),
@@ -452,6 +533,15 @@ class _DrawingScreenState extends State<DrawingScreen> {
             TextButton(
               onPressed: () {
                 setState(() {
+                  _texts.remove(text);
+                });
+                Navigator.of(context).pop();
+              },
+              child: Text('Delete'),
+            ),
+            TextButton(
+              onPressed: () {
+                setState(() {
                   text.text = textController.text;
                   text.fontFamily = selectedFontFamily;
                   text.fontSize = selectedFontSize;
@@ -460,267 +550,431 @@ class _DrawingScreenState extends State<DrawingScreen> {
               },
               child: Text('OK'),
             ),
-            TextButton(
-              onPressed: () {
-                setState(() {
-                  _texts.remove(text);
-                });
-                Navigator.of(context).pop();
-              },
-              child: Text('Delete'),
-            ),
           ],
         );
       },
     );
   }
 
-  void _addShape(String shape, Offset startPosition) {
-    final newShape = _DrawnShape(
-      shape: shape,
-      color: _currentColor,
-      startPosition: startPosition,
-      endPosition: startPosition,
-      strokeWidth: _strokeWidth,
-    );
+  void _selectText(Offset position) {
+    for (var text in _texts) {
+      if (text.contains(_scalePosition(position))) {
+        setState(() {
+          _selectedText = text;
+          _dragStartText = _scalePosition(position);
+        });
+        return;
+      }
+    }
 
-    setState(() {
-      _currentShapeInstance = newShape;
-      _shapes.add(newShape);
-      _actions.add(EditAction(
-          type: "shape", object: newShape)); // Record the shape action
-    });
+    // If no text was selected, add new text
+    if (_selectedTool == 'text') {
+      _addText(position);
+    }
   }
 
-  void _clearAll() {
-    setState(() {
-      _scribbleNotifier.clear();
-      _texts.clear();
-      _shapes.clear();
-      _currentBrushStroke.clear();
-      _actions.clear();
-    });
+  void _moveText(Offset position) {
+    if (_selectedText != null && _dragStartText != null) {
+      setState(() {
+        Offset offset = _scalePosition(position) - _dragStartText!;
+        _selectedText!.position += offset;
+        _dragStartText = _scalePosition(position);
+      });
+    }
   }
 
-  void _onTapOutside() {
-    setState(() {
-      _currentShapeInstance =
-          null; // Stop adjusting shapes when clicking outside
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: _onTapOutside, // Call this method when tapping outside
-      child: Scaffold(
-        appBar: AppBar(
-          title: Text('Drawing Screen'),
-          actions: [
-            IconButton(
-              icon: Icon(Icons.color_lens),
-              tooltip: 'Pick Color',
-              onPressed: _pickColor,
-            ),
-            IconButton(
-              icon: Icon(Icons.brush),
-              tooltip: 'Brush',
-              onPressed: _activateDrawingMode, // Set drawing mode
-            ),
-            IconButton(
-              icon: Icon(Icons.line_weight),
-              tooltip: 'Stroke Width',
-              onPressed: _pickStrokeWidth,
-            ),
-            IconButton(
-              icon: Icon(Icons.text_fields),
-              tooltip: 'Text',
-              onPressed: () {
-                setState(() {
-                  _isTextMode = true;
-                  _isDrawingMode = false;
-                  _isShapeMode = false;
-                  _currentShapeInstance = null; // Stop adjusting shapes
-                });
-              },
-            ),
-            PopupMenuButton<String>(
-              icon: Icon(Icons.crop_square),
-              tooltip: 'Shapes',
-              onSelected: (value) {
-                setState(() {
-                  _isShapeMode = true;
-                  _isDrawingMode = false;
-                  _isTextMode = false;
-                  _currentShape = value;
-                });
-              },
-              itemBuilder: (context) => [
-                PopupMenuItem(
-                  value: 'line',
-                  child: Text('Line'),
-                ),
-                PopupMenuItem(
-                  value: 'circle',
-                  child: Text('Circle'),
-                ),
-                PopupMenuItem(
-                  value: 'rectangle',
-                  child: Text('Rectangle'),
-                ),
-                PopupMenuItem(
-                  value: 'square',
-                  child: Text('Square'),
-                ),
-              ],
-            ),
-            IconButton(
-              icon: Icon(Icons.clear),
-              tooltip: 'Clear All',
-              onPressed: _clearAll,
-            ),
-            IconButton(
-              icon: Icon(Icons.undo),
-              tooltip: 'Undo',
-              onPressed: _undo,
-            ),
-            IconButton(
-              icon: Icon(Icons.save),
-              tooltip: 'Save',
-              onPressed: _showSaveOptions,
-            ),
-          ],
+  void _selectColor() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Pick Color'),
+        content: SingleChildScrollView(
+          child: BlockPicker(
+            pickerColor: _selectedColor,
+            onColorChanged: (color) {
+              setState(() {
+                _selectedColor = color;
+              });
+            },
+            availableColors: [
+              Colors.red,
+              Colors.pink,
+              Colors.purple,
+              Colors.deepPurple,
+              Colors.indigo,
+              Colors.blue,
+              Colors.lightBlue,
+              Colors.cyan,
+              Colors.teal,
+              Colors.green,
+              Colors.lightGreen,
+              Colors.lime,
+              Colors.yellow,
+              Colors.amber,
+              Colors.orange,
+              Colors.deepOrange,
+              Colors.brown,
+              Colors.grey,
+              Colors.blueGrey,
+              Colors.black,
+              Colors.white, // Adding white color here
+            ],
+          ),
         ),
-        body: Stack(
-          children: [
-            if (_image != null) Center(child: Image.file(_image!)),
-            Positioned.fill(
-              child: GestureDetector(
-                onPanStart: (details) {
-                  if (_isShapeMode) {
-                    _addShape(_currentShape, details.localPosition);
-                  } else if (_isDrawingMode) {
-                    setState(() {
-                      _currentBrushStroke = [details.localPosition];
-                    });
-                  }
-                },
-                onPanUpdate: (details) {
-                  if (_isShapeMode && _currentShapeInstance != null) {
-                    setState(() {
-                      _currentShapeInstance!.endPosition =
-                          details.localPosition;
-                    });
-                  } else if (_isDrawingMode) {
-                    setState(() {
-                      _currentBrushStroke.add(details.localPosition);
-                    });
-                  }
-                },
-                onPanEnd: (details) {
-                  if (_isDrawingMode) {
-                    setState(() {
-                      _shapes.add(_DrawnShape(
-                        shape:
-                            'line', // Using 'line' to represent freehand brush strokes
-                        color: _currentColor,
-                        startPosition: _currentBrushStroke.first,
-                        endPosition: _currentBrushStroke.last,
-                        strokeWidth: _strokeWidth,
-                        points: _currentBrushStroke,
-                      ));
-                      _currentBrushStroke = [];
-                      _actions
-                          .add(EditAction(type: "brush", object: _shapes.last));
-                    });
-                  }
-                },
-                onTapUp: (details) {
-                  if (_isTextMode) {
-                    _addText(details.localPosition);
-                  }
-                },
-                child: RepaintBoundary(
-                  key: _repaintKey,
-                  child: CustomPaint(
-                    painter: ShapePainter(
-                      shapes: _shapes,
-                      currentShape: _currentShapeInstance,
-                      currentBrushStroke: _currentBrushStroke,
-                      strokeColor: _currentColor,
-                      strokeWidth: _strokeWidth,
-                    ),
-                    child: Container(),
-                  ),
-                ),
-              ),
-            ),
-            ..._texts.map((text) => Positioned(
-                  left: text.position.dx,
-                  top: text.position.dy,
-                  child: GestureDetector(
-                    onPanUpdate: (details) {
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text('Done'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showStrokeWidthDialog() {
+    double tempStrokeWidth = _strokeWidth;
+    showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              title: Text('Pick stroke width'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Slider(
+                    value: tempStrokeWidth,
+                    min: 0.5, // Adjust as needed
+                    max: 10.0,
+                    divisions: 19, // More divisions for finer control
+                    label: tempStrokeWidth.toString(),
+                    onChanged: (value) {
                       setState(() {
-                        text.position = Offset(
-                          text.position.dx + details.delta.dx,
-                          text.position.dy + details.delta.dy,
-                        );
+                        tempStrokeWidth = value;
                       });
                     },
-                    onTap: () => _editText(text),
-                    child: Container(
-                      width: text.size.width,
-                      height: text.size.height,
-                      decoration: BoxDecoration(
-                        border: Border.all(color: Colors.grey),
-                      ),
-                      child: Stack(
-                        children: [
-                          Positioned.fill(
-                            child: Align(
-                              alignment: Alignment.center,
-                              child: Text(
-                                text.text,
-                                style: GoogleFonts.getFont(
-                                  text.fontFamily,
-                                  color: text.color,
-                                  fontSize: text.fontSize,
-                                ),
-                              ),
-                            ),
-                          ),
-                          Positioned(
-                            right: 0,
-                            bottom: 0,
-                            child: GestureDetector(
-                              onPanUpdate: (details) {
-                                setState(() {
-                                  text.size = Size(
-                                    text.size.width + details.delta.dx,
-                                    text.size.height + details.delta.dy,
-                                  );
-                                });
-                              },
-                              child: Icon(
-                                Icons.open_with,
-                                color: Colors.blue,
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
                   ),
-                )),
-          ],
+                  TextButton(
+                    onPressed: () {
+                      setState(() {
+                        _strokeWidth = tempStrokeWidth;
+                      });
+                      Navigator.of(context).pop();
+                    },
+                    child: Text('OK'),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Icon _getShapeIcon(ShapeType type) {
+    switch (type) {
+      case ShapeType.Line:
+        return Icon(Icons.show_chart);
+      case ShapeType.Circle:
+        return Icon(Icons.circle);
+      case ShapeType.Rectangle:
+        return Icon(Icons.crop_16_9);
+      case ShapeType.Square:
+        return Icon(Icons.crop_square);
+      case ShapeType.Ellipse:
+        return Icon(Icons.crop_7_5); // Updated icon for ellipse
+      default:
+        return Icon(Icons.crop_square);
+    }
+  }
+
+  void _undo() {
+    setState(() {
+      if (_actions.isNotEmpty) {
+        final lastAction = _actions.removeLast();
+        if (lastAction.type == "stroke") {
+          _strokes.remove(lastAction.object);
+        } else if (lastAction.type == "shape") {
+          _shapes.remove(lastAction.object);
+        } else if (lastAction.type == "text") {
+          _texts.remove(lastAction.object);
+        }
+      }
+    });
+  }
+
+  void _onTap(Offset position) {
+    for (var text in _texts) {
+      if (text.contains(_scalePosition(position))) {
+        _editText(text);
+        return;
+      }
+    }
+
+    // Add new text if text tool is selected and no existing text is tapped
+    if (_selectedTool == 'text') {
+      _addText(position);
+    }
+  }
+
+  Widget _buildToolbar() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+      children: [
+        _buildToolButton(
+          icon: Icons.color_lens,
+          onPressed: _selectColor,
+          toolName: 'Color Picker',
+          isSelected: _selectedTool == 'color',
         ),
-        floatingActionButton: FloatingActionButton(
-          onPressed: _pickImage,
-          tooltip: 'Pick Image',
-          child: Icon(Icons.image),
+        _buildToolButton(
+          icon: Icons.brush,
+          onPressed: () => _selectTool('brush'),
+          toolName: 'Brush',
+          isSelected: _selectedTool == 'brush',
+        ),
+        _buildToolButton(
+          icon: Icons.line_weight,
+          onPressed: _showStrokeWidthDialog,
+          toolName: 'Stroke Width',
+          isSelected: _selectedTool == 'strokeWidth',
+        ),
+        DropdownButton<ShapeType>(
+          value: _selectedShapeType,
+          hint: Icon(
+            Icons.crop_square,
+            color: _selectedTool == 'shape'
+                ? Colors.blue
+                : null, // Ensure the hint icon color reflects the selection state
+          ),
+          items: ShapeType.values.map((ShapeType type) {
+            return DropdownMenuItem<ShapeType>(
+              value: type,
+              child: Row(
+                children: [
+                  Icon(
+                    _getShapeIcon(type).icon,
+                    color: _selectedShapeType == type
+                        ? Colors.blue
+                        : null, // Change color if selected
+                  ),
+                  SizedBox(width: 10),
+                  Text(type.toString().split('.').last),
+                ],
+              ),
+            );
+          }).toList(),
+          onChanged: (value) {
+            _selectShapeType(value);
+            _selectTool(
+                'shape'); // Ensure shape tool is selected when a shape is chosen
+          },
+        ),
+        _buildToolButton(
+          icon: Icons.text_fields,
+          onPressed: () => _selectTool('text'),
+          toolName: 'Text',
+          isSelected: _selectedTool == 'text',
+        ),
+        _buildToolButton(
+          icon: Icons.clear,
+          onPressed: _clearAll,
+          toolName: 'Clear All',
+          isSelected: _selectedTool == 'clearAll',
+        ),
+        _buildToolButton(
+          icon: Icons.undo,
+          onPressed: _undo,
+          toolName: 'Undo',
+          isSelected: _selectedTool == 'undo',
+        ),
+      ],
+    );
+  }
+
+  Widget _buildToolButton({
+    required IconData icon,
+    required VoidCallback onPressed,
+    required String toolName,
+    required bool isSelected,
+  }) {
+    return Tooltip(
+      message: toolName,
+      child: MouseRegion(
+        onEnter: (_) => setState(() {}),
+        onExit: (_) => setState(() {}),
+        child: IconButton(
+          icon: Icon(icon),
+          color: isSelected ? Colors.blue : null,
+          onPressed: onPressed,
+          hoverColor: Colors.blue[200], // Change color on hover
         ),
       ),
     );
+  }
+}
+
+class ImagePainter extends CustomPainter {
+  final ui.Image image;
+  final List<Stroke> strokes;
+  final Color color;
+  final double strokeWidth;
+  final List<Shape> shapes;
+  final List<_DrawnText> texts;
+  final Shape? selectedShape;
+  final _DrawnText? selectedText;
+  final double scaleFactor;
+  final bool isSaving;
+
+  ImagePainter({
+    required this.image,
+    required this.strokes,
+    required this.color,
+    required this.strokeWidth,
+    required this.shapes,
+    required this.texts,
+    required this.selectedShape,
+    required this.selectedText,
+    required this.scaleFactor,
+    required this.isSaving,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.scale(scaleFactor, scaleFactor);
+    canvas.drawImage(image, Offset.zero, Paint());
+
+    final paint = Paint()
+      ..color = color
+      ..strokeCap = StrokeCap.round
+      ..strokeWidth = strokeWidth / scaleFactor;
+
+    for (var stroke in strokes) {
+      final strokePaint = Paint()
+        ..color = stroke.color
+        ..strokeCap = StrokeCap.round
+        ..strokeWidth = stroke.strokeWidth / scaleFactor;
+
+      for (int i = 0; i < stroke.points.length - 1; i++) {
+        if (stroke.points[i] != Offset.zero &&
+            stroke.points[i + 1] != Offset.zero) {
+          canvas.drawLine(stroke.points[i], stroke.points[i + 1], strokePaint);
+        }
+      }
+    }
+
+    for (var shape in shapes) {
+      final shapePaint = Paint()
+        ..color = shape.color
+        ..strokeWidth = shape.strokeWidth / scaleFactor
+        ..style = PaintingStyle.stroke;
+
+      final Offset start = shape.start;
+      final Offset end = shape.end;
+
+      switch (shape.type) {
+        case ShapeType.Line:
+          canvas.drawLine(start, end, shapePaint);
+          break;
+        case ShapeType.Ellipse:
+          Rect rect = Rect.fromPoints(start, end);
+          canvas.drawOval(rect, shapePaint);
+          break;
+        case ShapeType.Circle:
+          double radius = (start - end).distance / 2;
+          Offset center =
+              Offset((start.dx + end.dx) / 2, (start.dy + end.dy) / 2);
+          canvas.drawCircle(center, radius, shapePaint);
+          break;
+        case ShapeType.Square:
+          double side = (end - start).dx.abs();
+          Rect rect = Rect.fromLTWH(start.dx, start.dy, side, side);
+          canvas.drawRect(rect, shapePaint);
+          break;
+        case ShapeType.Rectangle:
+          Rect rect = Rect.fromPoints(start, end);
+          canvas.drawRect(rect, shapePaint);
+          break;
+      }
+    }
+
+    for (var text in texts) {
+      final textSize = text.calculateSize();
+      final textPainter = TextPainter(
+        text: TextSpan(
+          text: text.text,
+          style: GoogleFonts.getFont(text.fontFamily).copyWith(
+            color: text.color,
+            fontSize: text.fontSize / scaleFactor,
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      );
+
+      textPainter.layout(minWidth: 0, maxWidth: double.infinity);
+      textPainter.paint(canvas, text.position);
+
+      if (selectedText == text && !isSaving) {
+        final handlePaint = Paint()..color = Colors.blue;
+        final handleSize = 10.0 / scaleFactor;
+        final handleRect = Rect.fromLTWH(
+          text.position.dx + textSize.width - handleSize / 2,
+          text.position.dy + textSize.height - handleSize / 2,
+          handleSize,
+          handleSize,
+        );
+        canvas.drawRect(handleRect, handlePaint);
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(CustomPainter oldDelegate) {
+    return true;
+  }
+}
+
+class EditAction {
+  String type;
+  dynamic object;
+
+  EditAction({
+    required this.type,
+    required this.object,
+  });
+}
+
+class Stroke {
+  List<Offset> points;
+  Color color;
+  double strokeWidth;
+
+  Stroke({
+    required this.color,
+    required this.strokeWidth,
+  }) : points = [];
+}
+
+class Shape {
+  final ShapeType type;
+  Offset start;
+  Offset end;
+  final Color color;
+  final double strokeWidth;
+
+  Shape({
+    required this.type,
+    required this.start,
+    required this.end,
+    required this.color,
+    required this.strokeWidth,
+  });
+
+  bool contains(Offset point) {
+    Rect bounds = Rect.fromPoints(start, end);
+    return bounds.contains(point);
   }
 }
 
@@ -737,184 +991,31 @@ class _DrawnText {
     required this.color,
     required this.position,
     required this.size,
-    this.fontFamily = 'Roboto', // Default font family
-    this.fontSize = 24.0, // Default font size
-  });
-}
-
-class _DrawnShape {
-  String shape;
-  Color color;
-  Offset startPosition;
-  Offset endPosition;
-  double strokeWidth;
-  List<Offset>? points;
-
-  _DrawnShape({
-    required this.shape,
-    required this.color,
-    required this.startPosition,
-    required this.endPosition,
-    required this.strokeWidth,
-    this.points,
+    this.fontFamily = 'Roboto',
+    this.fontSize = 20.0, // Default font size
   });
 
-  get rect => Rect.fromPoints(startPosition, endPosition);
-
-  void paintShape(img.Image image, int color, double scaleX, double scaleY) {
-    final rect = Rect.fromLTRB(
-      this.rect.left * scaleX,
-      this.rect.top * scaleY,
-      this.rect.right * scaleX,
-      this.rect.bottom * scaleY,
+  // Method to calculate the size of the text bounding box
+  Size calculateSize() {
+    final textPainter = TextPainter(
+      text: TextSpan(
+        text: text,
+        style: GoogleFonts.getFont(fontFamily).copyWith(
+          color: color,
+          fontSize: fontSize,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
     );
 
-    int centerX = rect.center.dx.toInt();
-    int centerY = rect.center.dy.toInt();
-    int radius = (rect.width / 2).toInt();
-    int scaledStartX = rect.left.toInt();
-    int scaledStartY = rect.top.toInt();
-    int scaledEndX = rect.right.toInt();
-    int scaledEndY = rect.bottom.toInt();
-
-    for (int i = 0; i < strokeWidth.toInt(); i++) {
-      switch (shape) {
-        case 'line':
-          if (points != null) {
-            for (int i = 0; i < points!.length - 1; i++) {
-              img.drawLine(image, points![i].dx.toInt(), points![i].dy.toInt(),
-                  points![i + 1].dx.toInt(), points![i + 1].dy.toInt(), color);
-            }
-          }
-          break;
-        case 'circle':
-          img.drawCircle(image, centerX, centerY, radius + i, color);
-          break;
-        case 'rectangle':
-          img.drawRect(image, scaledStartX + i, scaledStartY + i,
-              scaledEndX - i, scaledEndY - i, color);
-          break;
-        case 'square':
-          int size = rect.width < rect.height
-              ? rect.width.toInt()
-              : rect.height.toInt();
-          int squareStartX = (rect.center.dx - size / 2).toInt();
-          int squareStartY = (rect.center.dy - size / 2).toInt();
-          int squareEndX = (rect.center.dx + size / 2).toInt();
-          int squareEndY = (rect.center.dy + size / 2).toInt();
-          img.drawRect(image, squareStartX + i, squareStartY + i,
-              squareEndX - i, squareEndY - i, color);
-          break;
-      }
-    }
-  }
-}
-
-class ShapePainter extends CustomPainter {
-  final List<_DrawnShape> shapes;
-  final _DrawnShape? currentShape;
-  final List<Offset> currentBrushStroke;
-  final Color strokeColor;
-  final double strokeWidth;
-
-  ShapePainter({
-    required this.shapes,
-    this.currentShape,
-    required this.currentBrushStroke,
-    required this.strokeColor,
-    required this.strokeWidth,
-  });
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = strokeColor
-      ..strokeWidth = strokeWidth
-      ..style = PaintingStyle.stroke
-      ..strokeCap = StrokeCap.round;
-
-    for (final shape in shapes) {
-      final shapePaint = Paint()
-        ..color = shape.color
-        ..strokeWidth = shape.strokeWidth
-        ..style = PaintingStyle.stroke;
-
-      final rect = Rect.fromPoints(shape.startPosition, shape.endPosition);
-
-      switch (shape.shape) {
-        case 'line':
-          if (shape.points != null) {
-            final path = Path()
-              ..moveTo(shape.points!.first.dx, shape.points!.first.dy);
-            for (final point in shape.points!) {
-              path.lineTo(point.dx, point.dy);
-            }
-            canvas.drawPath(path, shapePaint);
-          } else {
-            canvas.drawLine(shape.startPosition, shape.endPosition, shapePaint);
-          }
-          break;
-        case 'circle':
-          final radius = (shape.endPosition - shape.startPosition).distance / 2;
-          final center = (shape.startPosition + shape.endPosition) / 2;
-          canvas.drawCircle(center, radius, shapePaint);
-          break;
-        case 'rectangle':
-          canvas.drawRect(rect, shapePaint);
-          break;
-        case 'square':
-          final size = (shape.endPosition - shape.startPosition).distance;
-          final center = (shape.startPosition + shape.endPosition) / 2;
-          final squareRect =
-              Rect.fromCenter(center: center, width: size, height: size);
-          canvas.drawRect(squareRect, shapePaint);
-          break;
-      }
-    }
-
-    if (currentShape != null) {
-      final rect = Rect.fromPoints(
-          currentShape!.startPosition, currentShape!.endPosition);
-
-      switch (currentShape!.shape) {
-        case 'line':
-          canvas.drawLine(
-              currentShape!.startPosition, currentShape!.endPosition, paint);
-          break;
-        case 'circle':
-          final radius =
-              (currentShape!.endPosition - currentShape!.startPosition)
-                      .distance /
-                  2;
-          final center =
-              (currentShape!.startPosition + currentShape!.endPosition) / 2;
-          canvas.drawCircle(center, radius, paint);
-          break;
-        case 'rectangle':
-          canvas.drawRect(rect, paint);
-          break;
-        case 'square':
-          final size = (currentShape!.endPosition - currentShape!.startPosition)
-              .distance;
-          final center =
-              (currentShape!.startPosition + currentShape!.endPosition) / 2;
-          final squareRect =
-              Rect.fromCenter(center: center, width: size, height: size);
-          canvas.drawRect(squareRect, paint);
-          break;
-      }
-    }
-
-    if (currentBrushStroke.isNotEmpty) {
-      final path = Path()
-        ..moveTo(currentBrushStroke.first.dx, currentBrushStroke.first.dy);
-      for (final point in currentBrushStroke) {
-        path.lineTo(point.dx, point.dy);
-      }
-      canvas.drawPath(path, paint);
-    }
+    textPainter.layout(minWidth: 0, maxWidth: double.infinity);
+    return Size(textPainter.width, textPainter.height);
   }
 
-  @override
-  bool shouldRepaint(CustomPainter oldDelegate) => true;
+  bool contains(Offset point) {
+    final textSize = calculateSize();
+    final rect = Rect.fromLTWH(
+        position.dx, position.dy, textSize.width, textSize.height);
+    return rect.contains(point);
+  }
 }
